@@ -1,0 +1,481 @@
+---
+title: "R code used to analyze Labyrinthula in JGI 18S amplicons from a global survey of Zostera marina"
+author: "Cassie Ettinger"
+date: "`r Sys.Date()`"
+output:  github_document
+---
+
+This RMarkdown follows the analysis of 18S amplicon data to look at the eukaryotic component of the <i>Zostera marina</i> (ZM) microbiome. This dataset and part of this analysis were previously published as part of a paper on the ZM mycobiome, whilst other parts of this analysis are taken my PhD dissertation. Dome of the previous code/analysis is copied and modified here to ensure this unit is reproducible on its own and consistent with the previous work. 
+
+If you use this data or analysis please cite the following accordingly:
+
+Ettinger C.L. 2020. casett/Global_ZM_fungi_amplicons v1.0. DOI: https://doi.org/10.5281/zenodo.4116550.
+
+Ettinger C.L., Vann L.E. and Eisen J.A., 2020. Global diversity and biogeography of the Zostera marina mycobiome. AEM. DOI: https://doi.org/10.1128/AEM.02795-20
+
+Ettinger, C. 2020. Taxonomic Diversity of the Bacterial and Fungal Communities Associated with the Seagrass, Zostera marina. https://www.proquest.com/docview/2460090049
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+opts_chunk$set(fig.width = 6, fig.height = 4)
+opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+```
+
+### Loading packages and setting up the analysis
+
+First, load in the R packages that will be used and make note of their versions.
+
+```{r load, message = FALSE, warning=FALSE}
+
+library(ggplot2)
+library(vegan)
+library(phyloseq)
+library(RColorBrewer)
+library(coin)
+library(knitr)
+library(rmarkdown)
+library(FSA)
+library(reshape)
+library(betapart)
+library(dada2)
+library(tidyverse) 
+library(magrittr) 
+library(ShortRead)
+library(ade4)
+library(geosphere)
+library(ecodist)
+library(DESeq2)
+library(VennDiagram)
+library(limma)
+library(maps)
+library(viridis)
+library(microbiome)
+library(patchwork)
+library(EcolUtils)
+library(biobroom)
+library(scales)
+library(ggplotify)
+library(Hmisc)
+library(minpack.lm)
+#show_col(viridis_pal(option = "C")(20)) #get hex codes
+
+#Get R package references
+#sink("test.bib")
+#out <- sapply(names(sessionInfo()$otherPkgs),function(x) print(citation(x), style = "Bibtex"))
+
+#print the session info - includes computer version, R version and package versions
+sessionInfo()
+```
+
+### Define standard error function
+```{r se}
+se <- function(x) sqrt(var(x)/length(x))
+
+```
+
+Going to set the "seed", this ensures any randomization always happens the same way if this analysis needs to be re-run 
+
+```{r seed}
+
+set.seed(5311)
+
+```
+
+# Primers used from JGI iTag protocol 
+
+### Eukaryotic primers:
+
+565F: CCAGCASCYGCGGTAATTCC
+948R: ACTTTCGTTCTTGATYRA
+
+Stoeck T, Bass D, Nebel M, Christen R, Jones MDM, Breiner H-W, et al.(2010). Multiple marker parallel tag environmental DNA sequencing reveals a highly complex eukaryotic community in marine anoxic water. Mol Ecol19 Suppl 1:21–31
+
+### Before using dada2 I removed primers as follows:
+
+```{bash, eval = FALSE}
+#SG_Read_ID includes one column with each line being the prefix ID of each read file
+
+#Eukaryotic primer set
+for read in $(cat SG_Read_ID.txt);
+do cutadapt -g CCAGCASCYGCGGTAATTCC -G ACTTTCGTTCTTGATYRA -o $read'_18S_R1.noprimers.fastq' -p $read'_18S_R2.noprimers.fastq' $read'.18S.R1.fastq.gz' $read'.18S.R2.fastq.gz';
+done
+
+```
+
+# Using DADA2 to create amplicon sequence variant (ASV) tables for 18S amplicon datasets
+
+Had to run the DADA2 steps on the UC Davis Genome Center computing cluster, copying code over here for reproducibility 
+
+## 18S DADA2 pipeline on cluster
+
+Using both F and R reads and merging with DADA2
+
+```{r dada2_18s, eval=FALSE}
+
+#path to data 
+raw_data <- "/share/eisenlab/casett/sg_jgi_amplicon/jgi_18s/"
+list.files(raw_data)
+
+#Sort and get sample names
+fnFs <- sort(list.files(raw_data, pattern="R1.noprimers.fastq.gz"))
+fnRs <- sort(list.files(raw_data, pattern="R2.noprimers.fastq.gz"))
+
+sample.names <- sapply(strsplit(fnFs, "_18S"), `[`, 1)
+
+#specify full paths to the data
+fnFs <- file.path(raw_data, fnFs)
+fnRs <- file.path(raw_data, fnRs)
+
+#Inspecting quality of data
+plotQualityProfile(fnFs[1:6]) #fwd reads for first 6 samples
+plotQualityProfile(fnRs[1:6]) #reverse reads for first 6 samples
+
+#specify where to save filtered data that we will generate and what to name the files
+#we will mostly filter to remove any 'N's which dada2 cannot handle
+filt_path <- file.path("/share/eisenlab/casett/sg_jgi_amplicon/jgi_18s/dada2_filtered_merged/")
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filtered.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filtered.fastq.gz"))
+
+#maxEE = 2
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, maxN=0, maxEE=c(2,2), truncQ=2, matchIDs =TRUE, rm.phix=TRUE, compress=TRUE, multithread=TRUE, verbose = TRUE)
+head(out)
+
+
+#get error rates
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+#graph error rate estimates
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+
+# Sample inference and merger of paired-end reads using big data method
+#https://benjjneb.github.io/dada2/bigdata_paired.html
+
+#file parsing
+sample.names <- sapply(strsplit(basename(filtFs), "_F_filtered.fastq.gz"), `[`, 1) # Assumes filename = samplename_XXX.fastq.gz
+sample.namesR <- sapply(strsplit(basename(filtRs), "_R_filtered.fastq.gz"), `[`, 1) # Assumes filename = samplename_XXX.fastq.gz
+if(!identical(sample.names, sample.namesR)) stop("Forward and reverse files do not match.")
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+mergers <- vector("list", length(sample.names))
+names(mergers) <- sample.names
+
+#process samples 
+for(sam in sample.names) {
+  cat("Processing:", sam, "\n")
+  derepF <- derepFastq(filtFs[[sam]])
+  ddF <- dada(derepF, err=errF, multithread=TRUE)
+  derepR <- derepFastq(filtRs[[sam]])
+  ddR <- dada(derepR, err=errR, multithread=TRUE)
+  merger <- mergePairs(ddF, derepF, ddR, derepR)
+  mergers[[sam]] <- merger
+}
+rm(derepF); rm(derepR)
+
+#Construct sequence table and remove chimeras
+seqtab <- makeSequenceTable(mergers)
+saveRDS(seqtab, "/share/eisenlab/casett/sg_jgi_amplicon/jgi_18s/seqtab.dd2.merged.rds") 
+
+#get dimensions of table
+dim(seqtab)
+
+#Remove chimeras
+seqtab2 <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE)
+
+dim(seqtab2)
+
+#Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab2)))
+
+#percent seqs passed 
+sum(seqtab2)/sum(seqtab) # 0.9546734
+
+#remove seqs less than 50 nucleotides (if there are any)
+seqtab3 <- seqtab2[,nchar(colnames(seqtab2)) %in% seq(50,588)]
+
+table(nchar(getSequences(seqtab3)))
+
+#write to disk
+saveRDS(seqtab3, "/share/eisenlab/casett/sg_jgi_amplicon/jgi_18s/seqtab.dd2.merged_nochimera.rds")
+
+#also save as csv
+write.csv(seqtab3,  "/share/eisenlab/casett/sg_jgi_amplicon/jgi_18s/seqtab.dd2.merged_nochimera.csv")
+
+
+#taxonomy with silva 138
+tax_silv_138 <- assignTaxonomy(seqtab3, "/share/eisenlab/casett/database/silva138/silva_nr_v138_train_set.fa", multithread=TRUE, tryRC = TRUE)
+
+#save taxonomy as R file
+saveRDS(tax_silv_138, "/share/eisenlab/casett/sg_jgi_amplicon/jgi_18s/seqtab.dd2.merged_nochimera_tax_silva_v138.rds") 
+
+#save as csv
+write.csv(tax_silv_138, "/share/eisenlab/casett/sg_jgi_amplicon/jgi_18s/seqtab.dd2.merged_nochimera_tax_silva_v138.csv")
+
+
+```
+
+# Pre-processing of dada2 generated ASVs for analysis
+
+### Load ASV tables in 
+Since they were saved on the cluster, load them in here
+
+```{r load_tabs}
+
+# Load mapping file
+mapping <- read.csv("data/Eisen_503251_iTag_metadata_updates_LEV_CLE.csv")
+
+
+# 18S 
+
+seqtab.nochimera.18s <- readRDS('data/seqtab.dd2.merged_nochimera.rds')
+tax.18s <- readRDS('data/seqtab.dd2.merged_nochimera_tax_silva_v138.rds')
+
+#Extract sequences from chimera free SV table:
+#uniquesToFasta(seqtab.nochimera.18s, 'data/unique_ASVs_jgi_18s.fasta', ids = paste0("18S_SV", seq(length(getSequences(seqtab.nochimera.18s)))))
+
+
+
+```
+
+
+### Relabel ASVs in ASV tables 
+```{r relab}
+
+
+# 18S
+
+seqtab_final.18s <- seqtab.nochimera.18s
+colnames(seqtab_final.18s) <- paste0("18S_SV", 1:ncol(seqtab_final.18s))
+
+tax_final.18s <- tax.18s
+rownames(tax_final.18s) <- paste0("18S_SV", 1:nrow(tax_final.18s))
+
+
+```
+
+### Make phyloseq object
+
+```{r physeq}
+
+# 18s
+
+row.names(mapping) <- mapping$Sample_ID_dada2
+mapping_file = sample_data(mapping)
+
+
+otu_table.18s = otu_table(seqtab_final.18s, taxa_are_rows=FALSE)
+
+taxa_table.18s = tax_table(tax_final.18s)
+ps.18s <- phyloseq(otu_table.18s,mapping_file, taxa_table.18s)
+ps.18s
+
+```
+
+
+# Investigating other microbial eukaryotes associated with ZM in 18S rRNA gene data
+
+```{r euk_process}
+#fix unclassifieds
+df.18s.tax.euk <- data.frame(tax_table(ps.18s))
+
+df.18s.tax.euk %<>% 
+  mutate(Phylum = fct_explicit_na(Phylum, na_level = "Unclassified"), 
+         Class = fct_explicit_na(Class, na_level = "Unclassified"), 
+         Order = fct_explicit_na(Order, na_level = "Unclassified"), 
+         Family = fct_explicit_na(Family, na_level = "Unclassified"), 
+         Genus = fct_explicit_na(Genus, na_level = "Unclassified"))
+
+row.names(df.18s.tax.euk) <- row.names(tax_table(ps.18s))
+dff.18S.tax.euk <- as.matrix(df.18s.tax.euk)
+
+tax_table(ps.18s) <- dff.18S.tax.euk
+
+#save RDS with fixed taxonomy
+saveRDS(ps.18s, "data/ps.18s.RDS")
+
+
+#remove handful of bacteria / mitochondria 
+ps.18s.euk <- subset_taxa(ps.18s, Kingdom == "Eukaryota")
+
+#remove Zostera marina
+ps.18s.euk.noZM <- subset_taxa(ps.18s.euk, Class != "Embryophyta")
+ps.18s.euk.noZM <- subset_samples(ps.18s.euk.noZM, Species == "Zostera marina")
+
+#subset samples to only global collections and samples with reads left
+ps.18s.euk.noZM_nz <- prune_samples(sample_sums(ps.18s.euk.noZM)>0, ps.18s.euk.noZM)
+
+ps.18s.euk.noZM_nz_ZEN <- subset_samples(ps.18s.euk.noZM_nz, Clone == "FALSE")
+
+#get rid of an ASVs that are 0s across whole dataset
+ps.18s.euk.noZM_nz_ZEN <- prune_taxa(taxa_sums(ps.18s.euk.noZM_nz_ZEN) > 0, ps.18s.euk.noZM_nz_ZEN)
+
+ps.18s.euk.noZM_nz_ZEN
+
+#save this filtered dataset
+saveRDS(ps.18s.euk.noZM_nz_ZEN, "data/ps.18s.euk.noZM_nz_ZEN.RDS")
+
+summary(as.factor(as.data.frame(sample_data(ps.18s.euk.noZM_nz_ZEN))$Sample.Isolated.From))
+
+#make compositional
+ps.18s.euk.noZM_nz_ZEN.RA <-  transform_sample_counts(ps.18s.euk.noZM_nz_ZEN, function(x) x / sum(x))
+
+
+```
+## This code produces Fig. S11 from Ettinger et al (2020)
+```{r eukplot, fig.width=12, fig.height=8}
+
+
+## collapse to phylum level ##
+
+ps.18s.euk.phy = tax_glom(ps.18s.euk.noZM_nz_ZEN.RA, taxrank="Phylum", NArm = FALSE)
+
+#combine fungi
+df.ps.18s.euk.phy <- data.frame(tax_table(ps.18s.euk.phy))
+
+df.ps.18s.euk.phy %<>% 
+  mutate(Phylum = ifelse(Phylum =="Blastocladiomycota" |Phylum =="Chytridiomycota" |Phylum =="Glomeromycota" |Phylum =="Neocallimastigomycota" |Phylum =="Ascomycota" |Phylum =="Basidiomycota" |Phylum =="Mucoromycota" |Phylum =="Zoopagomycota" |Phylum =="Cryptomycota" |Phylum =="Aphelidomycota" | Phylum == "Aphelidea", "Fungi", as.character(Phylum)))
+         
+
+df.ps.18s.euk.phy %<>% 
+  mutate(Phylum = ifelse(Phylum == "Cnidaria" |Phylum =="Nematozoa"| Phylum =="Annelida" |Phylum =="Lophophorata" | Phylum == "Platyhelminthes" | Phylum == "Arthropoda" | Phylum == "Bryozoa" | Phylum == "Mollusca" | Phylum == "Xenacoelomorpha" | Phylum == "Echinodermata" | Phylum == "Entoprocta" | Phylum == "Scalidophora" | Phylum == "Rotifera" | Phylum == "Nemertea" | Phylum == "Tardigrada" | Phylum == "Placozoa" | Phylum == "Vertebrata" | Phylum == "Gastrotricha" | Phylum == "Tunicata" | Phylum == "Porifera" | Phylum == "Ctenophora" | Phylum == "Hemichordata", "Animalia", as.character(Phylum))) 
+ 
+df.ps.18s.euk.phy %<>%
+  mutate(Phylum = ifelse(Phylum == "Holozoa_ph", "Holozoa", as.character(Phylum)),
+         Phylum = ifelse(Phylum == "Ochrophyta_ph", "Ochrophyta", as.character(Phylum)),
+         Phylum = ifelse(Phylum == "Chlorophyta_ph", "Chlorophyta", as.character(Phylum)))
+
+
+row.names(df.ps.18s.euk.phy) <- row.names(tax_table(ps.18s.euk.phy))
+dff.ps.18s.euk.phy<- as.matrix(df.ps.18s.euk.phy)
+
+tax_table(ps.18s.euk.phy) <- dff.ps.18s.euk.phy
+
+
+
+
+ps.18s.euk.phy_filt = filter_taxa(ps.18s.euk.phy, function(x) mean(x) > .001, TRUE)
+
+df_avg_18s.euk.phy_filt <- psmelt(ps.18s.euk.phy_filt)
+
+grouped_g_18s_euk.phy_filt <- group_by(df_avg_18s.euk.phy_filt, Sample.Isolated.From, Phylum)
+avgs_g_18s_euk.phy_filt <- summarise(grouped_g_18s_euk.phy_filt, mean=100*mean(Abundance), sd=100*sd(Abundance), se=100*se(Abundance))
+
+
+write.csv(avgs_g_18s_euk.phy_filt, "results/Eukaryotic_Mean_Abundance.csv")
+
+plot_euk_phy = ggplot(avgs_g_18s_euk.phy_filt, aes(x=Phylum, y= (mean), fill=Phylum)) + geom_bar(stat="identity",position=position_dodge()) + geom_errorbar(aes(ymin=(mean-se), ymax=(mean+se)), width=.4, position=position_dodge(.9))
+
+plot_euk_phy = plot_euk_phy + facet_wrap(~Sample.Isolated.From) + theme(axis.text.x = element_text(angle = -70, hjust = 0, vjust=.5), text = element_text(size=18)) + ylab("Mean Relative Abundance") + xlab("Taxonomic Group") + scale_fill_viridis_d(option = "magma") + labs(fill = "Taxonomic Group")
+plot_euk_phy
+
+
+ggsave(filename = 'plots/Mean_Euk_phyla.pdf', plot = last_plot(), device = 'pdf', width = 12, height = 7, dpi = 300)
+
+
+```
+
+
+## This code produces Figure S6-11 from my PhD disseration, Ettinger (2020) 
+```{r laby_plot, fig.width=12, fig.height=10}
+
+ps.18s.euk.laby = subset_taxa(ps.18s.euk.noZM_nz_ZEN, Phylum == "Labyrinthulomycetes")
+
+#remove samples with no reads and empty ASVs
+ps.18s.euk.laby.pr <- prune_samples(sample_sums(ps.18s.euk.laby)>0, ps.18s.euk.laby)
+ps.18s.euk.laby.pr <- prune_taxa(taxa_sums(ps.18s.euk.laby.pr) > 0, ps.18s.euk.laby.pr)
+
+#save
+saveRDS(ps.18s.euk.laby, "data/ps.18s.euk.laby.RDS")
+
+#make compostional (so within labys)
+ps.18s.euk.laby.RA <-  transform_sample_counts(ps.18s.euk.laby.pr, function(x) x / sum(x))
+
+ps.18s.euk.laby.RA
+#380 ASVs!
+
+summary(as.factor(as.data.frame(tax_table(ps.18s.euk.laby.RA))$Genus))
+# Labyrinthula Sicyoidochytrium Thraustochytrium          Ulkenia     Unclassified 
+#          164                2               19               32              163 
+
+#164 Labyrinthula ASVs - so quite a bit of diversity within that
+
+#collapse to genus (don't have species)
+ps.18s.euk.lab.gen = tax_glom(ps.18s.euk.laby.RA, taxrank="Genus", NArm = FALSE)
+
+
+ps.18s.euk.laby_filt = filter_taxa(ps.18s.euk.lab.gen, function(x) mean(x) > .01, TRUE)
+
+df_ps.18s.euk.laby_filt <- psmelt(ps.18s.euk.laby_filt)
+
+grouped_g_18s_euk.laby.filt<- group_by(df_ps.18s.euk.laby_filt, Sample.Isolated.From, Genus)
+
+grouped_g_18s_euk.laby.filt %<>% 
+  mutate(Class = ifelse(Class == "Labyrinthulomycetes_cl", "Labyrinthulomycetes", as.character(Class))) 
+
+grouped_g_18s_euk.laby.filt %<>% 
+  mutate(Genus = ifelse(Genus == "Unclassified" & Family == "Thraustochytriaceae", "Unclassified Thraustochytriaceae", as.character(Genus))) 
+
+avgs_g_18s_euk.laby.filt <- summarise(grouped_g_18s_euk.laby.filt, mean=100*mean(Abundance), sd=100*sd(Abundance), se=100*se(Abundance))
+
+
+#make factor to order bars by
+avgs_g_18s_euk.laby.filt$Genus <- factor(avgs_g_18s_euk.laby.filt$Genus, levels= c("Labyrinthula", "Thraustochytrium", "Ulkenia", "Unclassified Thraustochytriaceae", "Unclassified"))
+
+plot_lab_fam = ggplot(avgs_g_18s_euk.laby.filt, aes(x=Genus, y= (mean), fill=Sample.Isolated.From)) + geom_bar(stat="identity",position=position_dodge()) + geom_errorbar(aes(ymin=(mean-se), ymax=(mean+se)), width=.4, position=position_dodge(.9))
+
+plot_lab_fam = plot_lab_fam + facet_wrap(~Sample.Isolated.From) + theme(axis.text.x = element_text(angle = -70, hjust = 0, vjust=.5), text = element_text(size=18)) + ylab("Mean Relative Abundance") + xlab("Genus") + scale_fill_manual(values = c("#DCE318FF","#1F968BFF", "#3F4788FF")) + theme(legend.position = "none")
+
+#plot_lab_fam
+
+
+#subset to just Labyrinthula
+
+Labyrinthula <- subset_taxa(ps.18s.euk.laby_filt, Genus == "Labyrinthula")
+
+#subset to leaves
+Labyrinthula_filt_leaf <-subset_samples(Labyrinthula, Sample.Isolated.From == "leaf")
+ 
+#melt to df
+df_g <- psmelt(Labyrinthula_filt_leaf)
+
+# Reorder data to show biggest cities on top
+df_g <- df_g %>%
+  arrange(Abundance) %>%
+  mutate(Abundance=Abundance*100) 
+
+df_g$lat <- df_g$Latitude.Value.must.be.in.decimal.format.with.values.between..90.and.90.
+df_g$long <- df_g$Longitude.Value.must.be.in.decimal.format.with.values.between..180.and.180.
+
+
+grouped_g_ps_its_prune_leaf <- group_by(df_g, Site, Genus, lat, long, Sample.Isolated.From)
+avgs_g_ps_its_prune_leaf <- summarise(grouped_g_ps_its_prune_leaf, mean=mean(Abundance))
+
+
+mybreaks <- c(0,25,50,75,100)
+mylimits <- c(0, 100)
+
+#get map data
+globe <- map_data("world")
+
+# Build the map
+lab_map <- ggplot() +
+     geom_polygon(data = globe, aes(x=long, y = lat, group = group), fill="grey", alpha=0.3) +
+     geom_point(data=avgs_g_ps_its_prune_leaf, aes(x=long, y=lat, size = mean, color = mean), shape=20, stroke=FALSE) + 
+    scale_size_continuous(breaks=mybreaks, limits =mylimits) +
+    coord_quickmap(xlim = c(-175, 175),  ylim = c(25, 85)) +
+    scale_color_viridis(end = .9, breaks=mybreaks, limits =mylimits)+ theme(text = element_text(size=18)) + guides(color= guide_legend(title ="Mean Relative Abundance"), size=guide_legend(title ="Mean Relative Abundance")) + facet_wrap(~Sample.Isolated.From, strip.position = "left") +  theme(panel.background = element_blank(), panel.border =element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), legend.key = element_rect(fill = NA, color = NA), axis.text.y = element_blank(), axis.text.x = element_blank(), axis.title.x=element_blank(), axis.ticks.y=element_blank(), axis.ticks.x=element_blank(), axis.title.y=element_blank())
+  
+#lab_map
+
+#plot laby on leaves globally & % of Labyrinthulomycetes per sample type
+lab_map / plot_lab_fam + plot_annotation(tag_levels = 'A') + plot_layout(widths = c(2, 1), heights = unit(c(6, 1), c('cm', 'null')))
+
+ggsave(filename = 'plots/Laby.pdf', plot = last_plot(), device = 'pdf', width = 13, height = 10, dpi = 300)
+
+
+```
+
+
